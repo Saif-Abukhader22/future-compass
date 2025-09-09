@@ -1,1 +1,13 @@
-{}
+{
+  "name": "future-compass",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "start": "npm --prefix server start",
+    "dev": "npm --prefix server run dev",
+    "build": "npm --prefix server run build",
+    "server:start": "npm --prefix server start",
+    "server:dev": "npm --prefix server run dev",
+    "server:build": "npm --prefix server run build"
+  }
+}
