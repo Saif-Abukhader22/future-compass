@@ -1,0 +1,258 @@
+import traceback
+from io import BytesIO
+from typing import Optional, Annotated
+from uuid import UUID
+
+import pandas as pd
+
+import identity_service.schemas.user
+import identity_service.services.auth
+import identity_service.services.users
+from identity_service.schemas.auth import PasswordResetRequest, PasswordResetRequestForOld
+from shared.config import shared_settings
+from shared.emails.email import Email
+from shared.errors.identity import IdentityErrors
+from shared.users_sync import get_api_key
+from shared.users_sync.schema import UserRead, UserUpdate
+from shared.utils.logger import TsLogger
+from fastapi import APIRouter, HTTPException, Depends, status, Response, Request, UploadFile, Form, Body, File
+from fastapi.security import OAuth2PasswordRequestForm
+from identity_service.schemas.user import SocialLoginRequest
+from identity_service.schemas import auth as user_schema
+from identity_service.services import auth as auth_services
+from identity_service.routes.deps import SessionDep, CurrentUserUpgrade, get_api_key
+from identity_service.services.auth import get_device
+from identity_service.utils.user_utils import get_refresh_token, revoke_refresh_token
+from identity_service.routes.deps import get_current_user_upgrade
+from identity_service.utils.Error_Handling import ErrorCode
+from identity_service.services.auth import verify_recaptcha
+
+logger = TsLogger(name=__name__)
+
+auth_router = APIRouter(
+    tags=["Authentication"],
+)
+
+
+@auth_router.post("/login", response_model=user_schema.TokenData, status_code=status.HTTP_200_OK)
+async def login_user_service(request: Request,
+                             response: Response,
+                             db: SessionDep,
+                             form_data: OAuth2PasswordRequestForm = Depends()):
+    """Authenticates the user"""
+    auth_response = await auth_services.login_user(request, response, form_data, db)
+    return user_schema.TokenData.model_validate(auth_response)
+
+@auth_router.post("/social-login", response_model=user_schema.TokenData, status_code=status.HTTP_200_OK)
+async def social_login_endpoint(
+    request: Request,
+    payload: SocialLoginRequest,
+    response: Response,
+    db: SessionDep
+) -> user_schema.TokenData:
+    try:
+        auth_response = await auth_services.social_login(request=request, payload=payload, response=response, db=db)
+        return user_schema.TokenData.model_validate(auth_response)
+    except Exception as e:
+        traceback.print_exc()
+        logger.info(f"error is {str(e)}")
+        raise e
+
+
+@auth_router.post("/account", response_model=identity_service.schemas.user.UserRead,
+                  status_code=status.HTTP_201_CREATED)
+async def register_user(db: SessionDep,
+                        user_data: identity_service.schemas.user.UserCreate):
+    """Registers a new user and sends a verification code to their email"""
+    try:
+
+        existing_email = await identity_service.services.auth.get_user_by_email(db, user_data.email)
+        if existing_email:
+            if existing_email.is_old:
+                new_password_data = PasswordResetRequest(
+                    email= user_data.email,
+                    verificationCode= "",
+                    new_password=user_data.password,
+                    confirm_password=user_data.password,
+                )
+                return await auth_services.update_password_for_old_user(existing_email,new_password_data,db )
+            else:
+                raise HTTPException(status_code=400, detail=ErrorCode.EXIST_EMAIL)
+
+        # Check whitelist in development mode
+        # if shared_settings.ENVIRONMENT == "development":
+        #     user_dev = await identity_service.services.auth.register_white_user(user_data.email, db)
+        #     if user_dev is None:
+        #         raise HTTPException(
+        #             status_code=status.HTTP_403_FORBIDDEN,
+        #             detail=ErrorCode.UNAU_PUBLIC_REGIS.value
+        #         )
+        # If 0 provided (as id is int), set country_id to None to avoid DB errors
+        if user_data.country_id == 0:
+            user_data.country_id = None
+
+        user = await identity_service.services.auth.create_user(user_data, db)
+        return identity_service.schemas.user.UserRead.model_validate(user)
+    except HTTPException as e:
+        logger.info(str(e))
+        traceback.print_exc()
+        await db.rollback()
+        raise e
+    except Exception as e:
+        traceback.print_exc()
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"{str(e)}")
+
+
+# Used in confirm E-mail on registration
+@auth_router.post("/verify-registration", status_code=status.HTTP_202_ACCEPTED)
+async def confirming_registration(confirmation_request: user_schema.RegistrationConfirmation, db: SessionDep):
+    """  """
+    try:
+        user = await identity_service.services.auth.get_user_by_email(db, confirmation_request.email)
+        if not user:
+            raise HTTPException(status_code=404, detail=ErrorCode.USER_NOT_FOUND)
+        await auth_services.confirm_email(user, confirmation_request, db)
+    except HTTPException as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{str(e)}")
+
+
+@auth_router.post("/send-code", status_code=status.HTTP_200_OK)
+async def send_verification_code_to_email(user_data: user_schema.EmailData, db: SessionDep):
+    """Send verification code to the user's email, used for password reset"""
+    await verify_recaptcha(user_data.recaptcha_token)
+    user = await identity_service.services.auth.get_user_by_email(db, user_data.email)  # Ensure this is awaited
+    if not user:
+        raise HTTPException(status_code=404, detail=IdentityErrors.USER_NOT_FOUND)
+    email_sent = await auth_services.send_email_with_vc_for_rest_password(user, db)
+    if not email_sent:
+        raise HTTPException(status_code=500, detail=ErrorCode.FAILED_TO_SEND_EMAIL)
+
+
+@auth_router.put("/reset-password", status_code=status.HTTP_202_ACCEPTED)
+async def update_password(user_data: user_schema.PasswordResetRequest, db: SessionDep):
+    """ Update user's password """
+    user = await identity_service.services.auth.get_user_by_email(db, user_data.email)
+    if not user:
+        raise HTTPException(status_code=404, detail=ErrorCode.USER_NOT_FOUND)
+    await auth_services.user_verification_code(user, user_data, db)
+    # TODO: We should send a warning email here to notify the user that their password has been changed and to contact us if they did not do that.
+    ############ Send Email ################
+    # user_read = UserRead.model_validate(user)
+    # email_service = Email(user_read)
+    # email_service.send_password_changed_email()
+    ########################################
+
+
+@auth_router.post("/refresh", response_model=user_schema.TokenData, status_code=status.HTTP_200_OK)
+async def refresh_token(request: Request, response: Response, db: SessionDep) -> user_schema.TokenData:
+    """This Route is used to request a new 'Access Token' by using the 'Refresh Token' (for logged-in users)."""
+    new_access_token = await get_refresh_token(request, response, db)
+
+    return user_schema.TokenData(
+        access_token=new_access_token
+    )
+
+
+@auth_router.post("/revoke")
+async def revoke_token(request: Request, response: Response, db: SessionDep, user_id: CurrentUserUpgrade):
+    """Revokes an 'Access Token' (for logged-in users)"""
+    user = await identity_service.services.auth.get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail=ErrorCode.USER_NOT_FOUND)
+    delete_rt = await revoke_refresh_token(
+        user=user,
+        request=request,
+        response=response,
+        db=db,
+    )
+    if delete_rt:
+        response.delete_cookie(
+            key="refresh_token",
+            path="/",  # match default path
+            samesite="lax",  # optional but safe to mirror it
+            secure=True if shared_settings.ENVIRONMENT != 'local' else False,
+        )
+
+    # ✅ Return the same `response` object to keep the Set-Cookie header
+    response.status_code = status.HTTP_200_OK
+    return response
+
+@auth_router.post("/upload-users", dependencies=[Depends(get_api_key)])
+async def upload_users(db: SessionDep,
+    file: UploadFile = File(...)
+
+):
+    # Step 1: Validate file type
+    if not file.filename.endswith((".xlsx", ".xls", ".csv")):
+        raise HTTPException(status_code=400, detail="Only Excel files are supported.")
+
+    try:
+        # Step 2: Read Excel directly from memory
+        contents = await file.read()
+        excel_data = pd.read_excel(BytesIO(contents))
+
+        # Step 3: Pass the dataframe to a modified function
+        await identity_service.services.auth.import_users_from_dataframe(excel_data, db)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process file: {str(e)}")
+
+    return {"message": "Users imported successfully."}
+
+@auth_router.post("/user-roles", response_model=identity_service.schemas.user.UserRead)
+async def upload_users(db: SessionDep, updated_role: identity_service.schemas.user.UserRoleUpdate, user_id: UUID, admin_id: UUID = Depends(get_current_user_upgrade)
+                       ):
+    try:
+        updated_user = await identity_service.services.auth.update_user_role(user_id, admin_id, updated_role, db)
+        return identity_service.schemas.user.UserRead.model_validate(updated_user)
+    except HTTPException as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"{str(e)}")
+
+
+
+if shared_settings.ENVIRONMENT == 'local':
+    # ######################## For Nayer ##################################
+    @auth_router.get("/local/get_user/", response_model=identity_service.schemas.user.UserRead,
+                     status_code=status.HTTP_200_OK)
+    async def get_user(db: SessionDep, user_id: UUID = Depends(get_current_user_upgrade)):
+        """ This Router Used For get User Data (for Loging Users)"""
+        user = await identity_service.services.auth.get_user_by_id(db, user_id)
+        return identity_service.schemas.user.UserRead.model_validate(user)
+
+
+    @auth_router.get("/local/device-type")
+    async def get_my_de(request: Request):
+        return await get_device(request)  # Made async to match get_device
+
+
+if shared_settings.ENVIRONMENT in ('local', 'development'):
+    @auth_router.post("/whitelist-user", dependencies=[Depends(get_api_key)])
+    async def create_whitelist_user(
+        email: str,
+        db: SessionDep,
+    ):
+        """
+        Create a new whitelisted user. Only allowed in local or development environments.
+        """
+        new_user = await identity_service.services.auth.add_white_user(email=email, db=db)
+        return {"email": new_user.email}
+
+    # @auth_router.delete("/whitelist-user", dependencies=[Depends(get_api_key)])
+    # async def create_whitelist_user(
+    #     email: str,
+    #     db: SessionDep,
+    # ):
+    #     """
+    #      ## delete user from all ms
+    #     Create a new whitelisted user. Only allowed in local or development environments.
+    #     """
+    #     return await identity_service.services.auth.delete_white_user(email=email, db=db)
+    #
+    #
