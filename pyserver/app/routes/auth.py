@@ -181,6 +181,105 @@ def revoke_tenant_key_route(body: RevokeTenantKeyBody):
         raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Key not found"})
     return {"ok": True}
 
+class KeyLoginBody(BaseModel):
+    key: str = Field(min_length=16)
+    displayName: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+@router.post("/tenant-login", summary="enter the users using auth key", tags=["auth"])
+def tenant_login_auth_key(req: Request, body: KeyLoginBody, response: Response):
+    """
+    Exchange a Tenant Authentication Key (tkn_...) for a standard session.
+    - Validates key format, revocation, and expiry
+    - Verifies secret against stored hash
+    - Creates/reuses a user bound to this key
+    - Returns access token; sets rotated refresh cookie
+    """
+    try:
+        raw_key = (body.key or "").strip()
+        parsed = parse_full_key(raw_key)
+        if not parsed or not isinstance(parsed, (list, tuple)) or len(parsed) < 2:
+            raise HTTPException(status_code=400, detail=_error_payload(
+                code="invalid_key", message="Authentication key is malformed"
+            ))
+
+        prefix, secret = parsed[0], parsed[1]
+        if not prefix or not secret:
+            raise HTTPException(status_code=400, detail=_error_payload(
+                code="invalid_key", message="Authentication key is invalid"
+            ))
+
+        # Fetch the key record by prefix (expects: id, tenantId, secret_hash, revoked, expires_at)
+        key_rec = getattr(db, "getTenantKeyByPrefix", lambda *_: None)(prefix)
+        if not key_rec:
+            # Do not reveal whether the key exists beyond a generic message
+            raise HTTPException(status_code=403, detail=_error_payload(
+                code="invalid_key", message="Authentication key is invalid"
+            ))
+
+        # Block revoked keys
+        if getattr(key_rec, "revoked", False):
+            raise HTTPException(status_code=403, detail=_error_payload(
+                code="key_revoked", message="Authentication key has been revoked"
+            ))
+
+        # Check expiry, if present
+        from datetime import datetime, timezone
+        exp_iso = getattr(key_rec, "expires_at", None)
+        if exp_iso:
+            try:
+                exp_dt = datetime.fromisoformat(exp_iso)
+                if exp_dt.tzinfo is None:
+                    exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                if exp_dt < datetime.now(timezone.utc):
+                    raise HTTPException(status_code=403, detail=_error_payload(
+                        code="key_expired", message="Authentication key has expired"
+                    ))
+            except HTTPException:
+                raise
+            except Exception:
+                if _debug_enabled():
+                    logger.warning("Invalid expires_at on key %s", getattr(key_rec, "id", None))
+
+        # Verify the key's secret against stored hash
+        stored_hash = getattr(key_rec, "secret_hash", None)
+        if not stored_hash or not verify_password(secret, stored_hash):
+            raise HTTPException(status_code=403, detail=_error_payload(
+                code="invalid_key", message="Authentication key is invalid"
+            ))
+
+        # Ensure tenant exists
+        tenant_id = getattr(key_rec, "tenantId", None) or getattr(key_rec, "tenant_id", None)
+        if not tenant_id:
+            raise HTTPException(status_code=500, detail=_error_payload(
+                code="invalid_key_record", message="Key record missing tenant"
+            ))
+        tenant = db.upsertTenant(tenant_id, tenant_id)
+
+        # Create or reuse a durable user bound to this key
+        key_id = getattr(key_rec, "id", None) or prefix  # prefix as fallback stable id
+        display = (body.displayName or "").strip()
+        user = getattr(db, "getOrCreateAuthKeyUser")(tenant.id, key_id, display)
+
+        # Success: mint tokens and set refresh cookie
+        token = create_jwt({"sub": user.id, "tenant": tenant.id, "email": getattr(user, "email", None)})
+        refresh = create_refresh_jwt({"sub": user.id, "tenant": tenant.id})
+        _set_refresh_cookie(response, refresh)
+
+        # Match your TokenData shape
+        return TokenData(access_token=token)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error(f"/tenant-login error: {e}\n{tb}")
+        detail = {"code": "internal_error", "message": "Failed to authenticate with key"}
+        if _debug_enabled():
+            detail["debug"] = str(e)
+            detail["trace"] = tb
+        raise HTTPException(status_code=500, detail=detail)
+
 
 @router.post("/signup")
 def signup(req: Request, body: SignupBody, response: Response):
@@ -304,22 +403,6 @@ async def login(req: Request, response: Response, body: LoginBody | None = None)
                 detail["debug"] = {"verificationCode": code}
             raise HTTPException(status_code=403, detail=detail)
         if not user.pw_hash:
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
             detail = _error_payload(
                 code="invalid_credentials",
                 message="Invalid email or password",
