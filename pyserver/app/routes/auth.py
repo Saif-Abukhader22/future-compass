@@ -6,14 +6,18 @@ import logging
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi import status
 from fastapi import UploadFile, File  # placeholders for parity with identity_service
+from fastapi.params import Depends
 from fastapi.security import OAuth2PasswordRequestForm
+from numpy.distutils.command.develop import develop
 from starlette.responses import JSONResponse
 import re
 from pydantic import BaseModel, Field, EmailStr
 from pydantic import TypeAdapter
 
+from shared import shared_settings
 from ..db import db
 from ..config import settings
+from ..models import WhitelistEmail
 from ..services.auth import (
     hash_password,
     verify_password,
@@ -181,6 +185,105 @@ def revoke_tenant_key_route(body: RevokeTenantKeyBody):
         raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Key not found"})
     return {"ok": True}
 
+class KeyLoginBody(BaseModel):
+    key: str = Field(min_length=16)
+    displayName: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+@router.post("/tenant-login", summary="enter the users using auth key", tags=["auth"])
+def tenant_login_auth_key(req: Request, body: KeyLoginBody, response: Response):
+    """
+    Exchange a Tenant Authentication Key (tkn_...) for a standard session.
+    - Validates key format, revocation, and expiry
+    - Verifies secret against stored hash
+    - Creates/reuses a user bound to this key
+    - Returns access token; sets rotated refresh cookie
+    """
+    try:
+        raw_key = (body.key or "").strip()
+        parsed = parse_full_key(raw_key)
+        if not parsed or not isinstance(parsed, (list, tuple)) or len(parsed) < 2:
+            raise HTTPException(status_code=400, detail=_error_payload(
+                code="invalid_key", message="Authentication key is malformed"
+            ))
+
+        prefix, secret = parsed[0], parsed[1]
+        if not prefix or not secret:
+            raise HTTPException(status_code=400, detail=_error_payload(
+                code="invalid_key", message="Authentication key is invalid"
+            ))
+
+        # Fetch the key record by prefix (expects: id, tenantId, secret_hash, revoked, expires_at)
+        key_rec = getattr(db, "getTenantKeyByPrefix", lambda *_: None)(prefix)
+        if not key_rec:
+            # Do not reveal whether the key exists beyond a generic message
+            raise HTTPException(status_code=403, detail=_error_payload(
+                code="invalid_key", message="Authentication key is invalid"
+            ))
+
+        # Block revoked keys
+        if getattr(key_rec, "revoked", False):
+            raise HTTPException(status_code=403, detail=_error_payload(
+                code="key_revoked", message="Authentication key has been revoked"
+            ))
+
+        # Check expiry, if present
+        from datetime import datetime, timezone
+        exp_iso = getattr(key_rec, "expires_at", None)
+        if exp_iso:
+            try:
+                exp_dt = datetime.fromisoformat(exp_iso)
+                if exp_dt.tzinfo is None:
+                    exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                if exp_dt < datetime.now(timezone.utc):
+                    raise HTTPException(status_code=403, detail=_error_payload(
+                        code="key_expired", message="Authentication key has expired"
+                    ))
+            except HTTPException:
+                raise
+            except Exception:
+                if _debug_enabled():
+                    logger.warning("Invalid expires_at on key %s", getattr(key_rec, "id", None))
+
+        # Verify the key's secret against stored hash
+        stored_hash = getattr(key_rec, "secret_hash", None)
+        if not stored_hash or not verify_password(secret, stored_hash):
+            raise HTTPException(status_code=403, detail=_error_payload(
+                code="invalid_key", message="Authentication key is invalid"
+            ))
+
+        # Ensure tenant exists
+        tenant_id = getattr(key_rec, "tenantId", None) or getattr(key_rec, "tenant_id", None)
+        if not tenant_id:
+            raise HTTPException(status_code=500, detail=_error_payload(
+                code="invalid_key_record", message="Key record missing tenant"
+            ))
+        tenant = db.upsertTenant(tenant_id, tenant_id)
+
+        # Create or reuse a durable user bound to this key
+        key_id = getattr(key_rec, "id", None) or prefix  # prefix as fallback stable id
+        display = (body.displayName or "").strip()
+        user = getattr(db, "getOrCreateAuthKeyUser")(tenant.id, key_id, display)
+
+        # Success: mint tokens and set refresh cookie
+        token = create_jwt({"sub": user.id, "tenant": tenant.id, "email": getattr(user, "email", None)})
+        refresh = create_refresh_jwt({"sub": user.id, "tenant": tenant.id})
+        _set_refresh_cookie(response, refresh)
+
+        # Match your TokenData shape
+        return TokenData(access_token=token)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error(f"/tenant-login error: {e}\n{tb}")
+        detail = {"code": "internal_error", "message": "Failed to authenticate with key"}
+        if _debug_enabled():
+            detail["debug"] = str(e)
+            detail["trace"] = tb
+        raise HTTPException(status_code=500, detail=detail)
+
 
 @router.post("/signup")
 def signup(req: Request, body: SignupBody, response: Response):
@@ -207,7 +310,21 @@ def signup(req: Request, body: SignupBody, response: Response):
             )
 
         normalized_email = _normalize_email(str(body.email))
+        # check if running in development
+        ENV = os.getenv("ENV", "development")
+        # check if email is in whitelist (enforced outside development)
+        if ENV != "development":
+            whitelist_item = db.getWhitlistItembyEmail(normalized_email)
+            if whitelist_item is None:
+                raise HTTPException(status_code=403, detail=_error_payload(
+                    code="not_in_whitelist",
+                    message="Invalid email",
+                    field="email",
+                ))
+
+        #id not raise http exception
         existing = db.getUserByEmail(tenant.id, normalized_email)
+
         if existing:
             raise HTTPException(
                 status_code=409,
@@ -250,6 +367,37 @@ def signup(req: Request, body: SignupBody, response: Response):
             detail["debug"] = str(e)
             detail["trace"] = tb
         raise HTTPException(status_code=500, detail=detail)
+
+    #create new end point dev/addUserWhiteList
+    #appear if it is in local or prod
+@router.post("/whitelist/users", tags=["whitelist"], status_code=status.HTTP_201_CREATED)
+def add_whitelist_user(body: WhitelistEmail):
+    """
+    Add an email to the whitelist table (unique on email).
+    """
+    email = _normalize_email(str(body.email))
+    try:
+        created = db.addWhitelistEmail(body.userId, email)  # expects to raise on duplicate
+        return {"userId": created.userId, "email": created.email}
+    except Exception as e:
+        # If your db layer raises a specific duplicate error, map it to 409
+        raise HTTPException(status_code=409, detail=_error_payload(
+            code="already_whitelisted", message="Email already whitelisted", field="email"
+        ))
+
+
+@router.delete("/whitelist/users/{email}", tags=["whitelist"], status_code=status.HTTP_204_NO_CONTENT)
+def delete_whitelist_user(email: str):
+    """
+    Delete an email from the whitelist table.
+    """
+    normalized = _normalize_email(email)
+    removed = db.deleteWhitelistEmail(normalized)  # returns True if deleted
+    if not removed:
+        raise HTTPException(status_code=404, detail=_error_payload(
+            code="not_found", message="Email not in whitelist", field="email"
+        ))
+    return
 
 
 @router.post("/login", response_model=TokenData)
@@ -304,22 +452,6 @@ async def login(req: Request, response: Response, body: LoginBody | None = None)
                 detail["debug"] = {"verificationCode": code}
             raise HTTPException(status_code=403, detail=detail)
         if not user.pw_hash:
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
             detail = _error_payload(
                 code="invalid_credentials",
                 message="Invalid email or password",

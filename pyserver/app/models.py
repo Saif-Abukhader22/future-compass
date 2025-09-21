@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from typing import Literal, Optional
-from pydantic import BaseModel, Field
-
+from pydantic import BaseModel, Field, EmailStr
 
 ID = str
 
@@ -73,3 +72,6 @@ class DBShape(BaseModel):
     threads: list[Thread]
     messages: list[Message]
 
+class WhitelistEmail(BaseModel):
+    userId: ID = Field(alias="userId")
+    email: EmailStr
