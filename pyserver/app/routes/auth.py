@@ -6,14 +6,18 @@ import logging
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi import status
 from fastapi import UploadFile, File  # placeholders for parity with identity_service
+from fastapi.params import Depends
 from fastapi.security import OAuth2PasswordRequestForm
+from numpy.distutils.command.develop import develop
 from starlette.responses import JSONResponse
 import re
 from pydantic import BaseModel, Field, EmailStr
 from pydantic import TypeAdapter
 
+from shared import shared_settings
 from ..db import db
 from ..config import settings
+from ..models import WhitelistEmail
 from ..services.auth import (
     hash_password,
     verify_password,
@@ -306,7 +310,21 @@ def signup(req: Request, body: SignupBody, response: Response):
             )
 
         normalized_email = _normalize_email(str(body.email))
+        # check if running in development
+        ENV = os.getenv("ENV", "development")
+        # check if email is in whitelist (enforced outside development)
+        if ENV != "development":
+            whitelist_item = db.getWhitlistItembyEmail(normalized_email)
+            if whitelist_item is None:
+                raise HTTPException(status_code=403, detail=_error_payload(
+                    code="not_in_whitelist",
+                    message="Invalid email",
+                    field="email",
+                ))
+
+        #id not raise http exception
         existing = db.getUserByEmail(tenant.id, normalized_email)
+
         if existing:
             raise HTTPException(
                 status_code=409,
@@ -349,6 +367,37 @@ def signup(req: Request, body: SignupBody, response: Response):
             detail["debug"] = str(e)
             detail["trace"] = tb
         raise HTTPException(status_code=500, detail=detail)
+
+    #create new end point dev/addUserWhiteList
+    #appear if it is in local or prod
+@router.post("/whitelist/users", tags=["whitelist"], status_code=status.HTTP_201_CREATED)
+def add_whitelist_user(body: WhitelistEmail):
+    """
+    Add an email to the whitelist table (unique on email).
+    """
+    email = _normalize_email(str(body.email))
+    try:
+        created = db.addWhitelistEmail(body.userId, email)  # expects to raise on duplicate
+        return {"userId": created.userId, "email": created.email}
+    except Exception as e:
+        # If your db layer raises a specific duplicate error, map it to 409
+        raise HTTPException(status_code=409, detail=_error_payload(
+            code="already_whitelisted", message="Email already whitelisted", field="email"
+        ))
+
+
+@router.delete("/whitelist/users/{email}", tags=["whitelist"], status_code=status.HTTP_204_NO_CONTENT)
+def delete_whitelist_user(email: str):
+    """
+    Delete an email from the whitelist table.
+    """
+    normalized = _normalize_email(email)
+    removed = db.deleteWhitelistEmail(normalized)  # returns True if deleted
+    if not removed:
+        raise HTTPException(status_code=404, detail=_error_payload(
+            code="not_found", message="Email not in whitelist", field="email"
+        ))
+    return
 
 
 @router.post("/login", response_model=TokenData)

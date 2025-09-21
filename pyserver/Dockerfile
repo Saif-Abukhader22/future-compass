@@ -1,43 +1,36 @@
-# identity-service (FastAPI) - DigitalOcean App Platform ready
-FROM python:3.11-slim-bullseye
+# --- build frontend ---
+FROM node:20 AS webbuild
+WORKDIR /web
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+ENV VITE_API_BASE_URL=/api
+RUN npm run build   # outputs /web/dist
 
-# Safer runtime defaults + app paths
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    APP_HOME=/app \
-    PORT=8080 \
-    WEB_CONCURRENCY=2
-
-WORKDIR $APP_HOME
-
-# ---- System deps (build & runtime) ----
-# libpq-dev + build-essential only needed if you compile psycopg from source.
-# file is for python-magic; remove if unused.
+# --- runtime: backend + nginx ---
+FROM python:3.11-slim
+WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libpq-dev build-essential file ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    build-essential libpq-dev nginx && \
+    rm -rf /var/lib/apt/lists/*
 
-# ---- Python deps first (better layer caching) ----
-COPY identity_service/requirements.txt ./identity_service/requirements.txt
-COPY shared/requirements.txt          ./shared/requirements.txt
+# python deps
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt gunicorn uvicorn
 
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r identity_service/requirements.txt \
- && pip install --no-cache-dir -r shared/requirements.txt
+# app code
+COPY backend/ ./backend
+# static site served by Nginx
+COPY --from=webbuild /web/dist /var/www/html
 
-# ---- App source ----
-COPY identity_service/ ./identity_service
-COPY shared/            ./shared
+# Nginx config: serve SPA and proxy /api to FastAPI on :8000
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 
-# ---- Shrink: drop build tools after wheels are installed ----
-RUN apt-get purge -y build-essential libpq-dev && apt-get autoremove -y && apt-get clean
-
-# ---- Non-root user ----
-RUN useradd -m appuser && chown -R appuser:appuser $APP_HOME
-USER appuser
-
-# App Platform routes to $PORT (default 8080)
+ENV PORT=8080
 EXPOSE 8080
 
-# Use $PORT and tunable worker count
-CMD sh -c 'uvicorn identity_service.main:app --host 0.0.0.0 --port ${PORT:-8080} --workers ${WEB_CONCURRENCY:-2}'
+# start both: backend (gunicorn) and nginx (simple sh supervisor)
+CMD bash -lc '\
+  gunicorn -k uvicorn.workers.UvicornWorker -w ${WORKERS:-3} -b 0.0.0.0:8000 backend.app.main:app & \
+  nginx -g "daemon off;" \
+'

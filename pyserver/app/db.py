@@ -8,6 +8,7 @@ from typing import Optional
 from uuid import uuid4
 import os
 import sqlite3
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -88,16 +89,25 @@ class PendingSignup:
     code_exp: str  # ISO exp time
     createdAt: str
 
+@dataclass
+class WhitelistItem:
+    userId: str
+    email: str
+
 
 def ensure_store() -> dict:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not DB_FILE.exists():
-        seed = {"tenants": [], "users": [], "agents": [], "threads": [], "messages": [], "pending_signups": []}
+        seed = {"tenants": [], "users": [], "agents": [], "threads": [], "messages": [], "pending_signups": [], "whitelist_users": []}
         DB_FILE.write_text(json.dumps(seed, indent=2), encoding="utf-8")
     data = json.loads(DB_FILE.read_text(encoding="utf-8"))
     # Migrate older files lacking pending_signups
     if "pending_signups" not in data:
         data["pending_signups"] = []
+        DB_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    # Migrate older files lacking whitelist_users
+    if "whitelist_users" not in data:
+        data["whitelist_users"] = []
         DB_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return data
 
@@ -174,6 +184,37 @@ class FileDB:
         if updated:
             save_store(store)
         return updated
+
+    # ---- Whitelist (File backend) ----
+    def addWhitelistEmail(self, userId: str, email: str) -> WhitelistItem:
+        store = ensure_store()
+        bucket = store.get("whitelist_users", [])
+        lower_email = (email or "").strip().lower()
+        # enforce unique by email (case-insensitive)
+        if any((r.get("email") or "").strip().lower() == lower_email for r in bucket):
+            raise ValueError("already_whitelisted")
+        rec = {"userId": str(userId), "email": lower_email}
+        bucket.append(rec)
+        store["whitelist_users"] = bucket
+        save_store(store)
+        return WhitelistItem(**rec)
+
+    def getWhitlistItembyEmail(self, email: str) -> Optional[WhitelistItem]:
+        store = ensure_store()
+        lower_email = (email or "").strip().lower()
+        r = next((r for r in store.get("whitelist_users", []) if (r.get("email") or "").strip().lower() == lower_email), None)
+        return WhitelistItem(**r) if r else None
+
+    def deleteWhitelistEmail(self, email: str) -> bool:
+        store = ensure_store()
+        lower_email = (email or "").strip().lower()
+        before = len(store.get("whitelist_users", []))
+        store["whitelist_users"] = [r for r in store.get("whitelist_users", []) if (r.get("email") or "").strip().lower() != lower_email]
+        after = len(store.get("whitelist_users", []))
+        if after != before:
+            save_store(store)
+            return True
+        return False
 
     def getUserByUsername(self, tenantId: str, username: str) -> Optional[User]:
         store = ensure_store()
@@ -508,6 +549,15 @@ class SqliteDB:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS whitelist_users (
+                    user_id TEXT,
+                    email TEXT UNIQUE
+                )
+                """
+            )
+
             con.commit()
 
     # ---- Tenant ----
@@ -599,6 +649,42 @@ class SqliteDB:
         with self._conn() as con:
             cur = con.cursor()
             cur.execute("UPDATE tenant_api_keys SET revoked=1 WHERE prefix=?", (prefix,))
+            con.commit()
+            return cur.rowcount > 0
+
+    # ---- Whitelist (SQLite backend) ----
+    def addWhitelistEmail(self, userId: str, email: str) -> WhitelistItem:
+        with self._conn() as con:
+            cur = con.cursor()
+            lower_email = (email or "").strip().lower()
+            try:
+                cur.execute(
+                    "INSERT INTO whitelist_users(user_id, email) VALUES(?,?)",
+                    (str(userId), lower_email),
+                )
+                con.commit()
+            except sqlite3.IntegrityError as e:
+                raise ValueError("already_whitelisted") from e
+            return WhitelistItem(userId=str(userId), email=lower_email)
+
+    def getWhitlistItembyEmail(self, email: str) -> Optional[WhitelistItem]:
+        with self._conn() as con:
+            cur = con.cursor()
+            cur.execute("SELECT user_id, email FROM whitelist_users WHERE lower(email)=lower(?)", (email,))
+            r = cur.fetchone()
+            if not r:
+                return None
+            def getv(k, idx):
+                try:
+                    return r[k]
+                except Exception:
+                    return r[idx]
+            return WhitelistItem(userId=getv("user_id", 0), email=getv("email", 1))
+
+    def deleteWhitelistEmail(self, email: str) -> bool:
+        with self._conn() as con:
+            cur = con.cursor()
+            cur.execute("DELETE FROM whitelist_users WHERE lower(email)=lower(?)", (email,))
             con.commit()
             return cur.rowcount > 0
 
@@ -1262,6 +1348,45 @@ class PostgresDB:
         with self._conn() as con:
             cur = con.cursor()
             cur.execute("UPDATE tenant_api_keys SET revoked=1 WHERE prefix=%s", (prefix,))
+            con.commit()
+            return cur.rowcount > 0
+
+    # ---- Whitelist (Postgres backend) ----
+    def addWhitelistEmail(self, userId: str, email: str) -> WhitelistItem:
+        with self._conn() as con:
+            cur = con.cursor()
+            lower_email = (email or "").strip().lower()
+            try:
+                cur.execute(
+                    "INSERT INTO whitelist_users(user_id, email) VALUES(%s,%s)",
+                    (str(userId), lower_email),
+                )
+                con.commit()
+            except Exception as e:
+                msg = str(e).lower()
+                if "unique" in msg and "email" in msg:
+                    raise ValueError("already_whitelisted") from e
+                raise
+            return WhitelistItem(userId=str(userId), email=lower_email)
+
+    def getWhitlistItembyEmail(self, email: str) -> Optional[WhitelistItem]:
+        with self._conn() as con:
+            cur = con.cursor()
+            cur.execute("SELECT user_id, email FROM whitelist_users WHERE lower(email)=lower(%s)", (email,))
+            r = cur.fetchone()
+            if not r:
+                return None
+            def getv(k, idx):
+                try:
+                    return r[k]
+                except Exception:
+                    return r[idx]
+            return WhitelistItem(userId=getv("user_id", 0), email=getv("email", 1))
+
+    def deleteWhitelistEmail(self, email: str) -> bool:
+        with self._conn() as con:
+            cur = con.cursor()
+            cur.execute("DELETE FROM whitelist_users WHERE lower(email)=lower(%s)", (email,))
             con.commit()
             return cur.rowcount > 0
 
