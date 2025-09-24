@@ -1,0 +1,46 @@
+name: future-compass
+
+services:
+  - name: backend
+    environment_slug: python
+    instance_size_slug: basic-xxs
+    source_dir: pyserver
+    http_port: 8080
+    build_command: pip install -r requirements.txt
+    run_command: uvicorn app.main:app --host 0.0.0.0 --port 8080
+    routes:
+      - path: /api
+        rewrite: /
+    health_check:
+      http_path: /health
+    envs:
+      - key: ENVIRONMENT
+        value: production
+      - key: ALLOW_DEV_FALLBACK
+        value: "0"
+      - key: USE_SQLITE
+        value: "1"
+      - key: OPENAI_API_KEY
+        type: SECRET
+        value: ""
+      - key: ZOHO_SMTP_SERVER
+        value: ""
+      - key: ZOHO_SMTP_PORT
+        value: "465"
+      - key: ZOHO_EMAIL
+        value: ""
+      - key: ZOHO_PASSWORD
+        type: SECRET
+        value: ""
+
+static_sites:
+  - name: frontend
+    environment_slug: html
+    source_dir: Chatbot
+    build_command: npm ci && npm run build
+    output_dir: dist
+    routes:
+      - path: /
+    envs:
+      - key: NODE_VERSION
+        value: "20"
